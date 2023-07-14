@@ -67,7 +67,8 @@ def get_encoded_length(prompt):
     length_after_extensions = apply_extensions('tokenized_length', prompt)
     if length_after_extensions is not None:
         return length_after_extensions
-
+    if shared.is_external_api:
+        return len(prompt)
     return len(encode(prompt)[0])
 
 
@@ -190,7 +191,7 @@ def _generate_reply(question, state, stopping_strings=None, is_chat=False):
     original_question = question
     if not is_chat:
         state = apply_extensions('state', state)
-        question = apply_extensions('input', question)
+        question = apply_extensions('input', question, state)
 
     # Finding the stopping strings
     all_stop_strings = []
@@ -200,7 +201,20 @@ def _generate_reply(question, state, stopping_strings=None, is_chat=False):
 
     if shared.args.verbose:
         print(f'\n\n{question}\n--------------------\n')
+        
+    if shared.is_external_api:
+        # does not support streaming yet       
+        try:            
+            original_reply = ''
+            res = shared.model(question,state,stopping_strings)
+            reply = res
+            reply = reply.replace('<extra_id_0>','')
+            yield reply
 
+        except Exception:
+            traceback.print_exc()
+        finally:
+            return
     shared.stop_everything = False
     clear_torch_cache()
     seed = set_manual_seed(state['seed'])
@@ -223,7 +237,7 @@ def _generate_reply(question, state, stopping_strings=None, is_chat=False):
             break
 
     if not is_chat:
-        reply = apply_extensions('output', reply)
+        reply = apply_extensions('output', reply, state)
 
     yield reply
 
@@ -262,7 +276,7 @@ def generate_reply_HF(question, original_question, seed, state, stopping_strings
     eos_token_ids = [shared.tokenizer.eos_token_id] if shared.tokenizer.eos_token_id is not None else []
     generate_params['eos_token_id'] = eos_token_ids
     generate_params['stopping_criteria'] = transformers.StoppingCriteriaList()
-    generate_params['stopping_criteria'].append(_StopEverythingStoppingCriteria());
+    generate_params['stopping_criteria'].append(_StopEverythingStoppingCriteria())
 
     t0 = time.time()
     try:
