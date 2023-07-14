@@ -58,10 +58,11 @@ def load_model(model_name, loader=None):
         'FlexGen': flexgen_loader,
         'RWKV': RWKV_loader,
         'ExLlama': ExLlama_loader,
-        'ExLlama_HF': ExLlama_HF_loader
+        'ExLlama_HF': ExLlama_HF_loader,
+        'External_Api': External_Api_loader
     }
 
-    if loader is None:
+    if loader is None or loader=='':
         if shared.args.loader is not None:
             loader = shared.args.loader
         else:
@@ -74,6 +75,7 @@ def load_model(model_name, loader=None):
     output = load_func_map[loader](model_name)
     if type(output) is tuple:
         model, tokenizer = output
+		
     else:
         model = output
         if model is None:
@@ -292,6 +294,19 @@ def ExLlama_HF_loader(model_name):
 
     return ExllamaHF.from_pretrained(model_name)
 
+
+def External_Api_loader(model_name):
+    print(f"Using external api: {model_name}")
+    try:
+        model_name = model_name[:-3]
+        exec(f"import models.{model_name}")
+        model_proxy = eval(f"models.{model_name}.model_handler")
+        tokenizer_proxy = eval(f"models.{model_name}.tokenizer_handler")
+        print('Ok.')
+        return model_proxy(),tokenizer_proxy()
+    except Exception as e:
+        print('Fail.'+ str(e))
+        return None, None
 
 def get_max_memory_dict():
     max_memory = {}

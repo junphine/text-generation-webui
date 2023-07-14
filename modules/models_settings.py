@@ -18,6 +18,9 @@ def get_model_settings_from_yamls(model):
 
 
 def infer_loader(model_name):
+    shared.is_external_api = '.py' in model_name.lower()
+    if shared.is_external_api:
+        return 'External_Api'
     path_to_model = Path(f'{shared.args.model_dir}/{model_name}')
     model_settings = get_model_settings_from_yamls(model_name)
     if not path_to_model.exists():
