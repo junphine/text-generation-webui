@@ -56,6 +56,7 @@
 
 .dark .chat .user-message {
     background-color: transparent;
+    border: 1px solid #4b5563;
 }
 
 code {

@@ -1,8 +1,9 @@
 import datetime
 from pathlib import Path
-
+import re
 import pandas as pd
 import torch
+import numpy as np
 from datasets import load_dataset
 from tqdm import tqdm
 
@@ -148,3 +149,119 @@ def is_in_past_evaluations(model, dataset, stride, max_length):
 def generate_markdown_table():
     sorted_df = past_evaluations.sort_values(by=['Dataset', 'stride', 'Perplexity', 'Date'])
     return sorted_df
+	
+def preprocess_logits_for_metrics(logits, labels):
+    """
+    Original Trainer may have a memory leak. 
+    This is a workaround to avoid storing too many tensors that are not needed.
+    """
+    pred_ids = torch.argmax(logits[0], dim=-1)
+    return pred_ids, labels
+
+def compute_accuracy_metrics(pred):
+    labels_ids = pred.label_ids
+    pred_ids = pred.predictions[0]   
+    #pred_ids = logits.argmax(axis=-1)    
+
+    c = 0.0001
+    tp=0
+    tn=0
+    fp=0
+    fn=0    
+    for i in range(0,len(pred_ids)):
+        line = labels_ids[i]
+        pred_line = pred_ids[i]
+        for j in range(2,len(line)):
+            if j>3 and pred_line[j]>=32595 and pred_line[j]<32695:
+                continue
+            if line[j]>1:
+                if line[j]==pred_line[j]:
+                    tp+=1
+                else:
+                    fp+=1
+                c+=1     
+    precision = tp/(tp+fp)
+    recall = tp/c
+    #pred_ids = np.where(pred_ids != -100, pred_ids, shared.tokenizer.pad_token_id)
+    #labels_ids = np.where(labels_ids != -100, labels_ids, shared.tokenizer.pad_token_id)
+
+    # all unnecessary tokens are removed
+    #pred_str = shared.tokenizer.batch_decode(pred_ids, skip_special_tokens=True,clean_up_tokenization_spaces=True)
+    #label_str = shared.tokenizer.batch_decode(labels_ids, skip_special_tokens=True,clean_up_tokenization_spaces=True)
+
+    #accuracy = sum([int(pred_str[i] == label_str[i]) for i in range(len(pred_str))]) / len(pred_str)
+
+    return {"precision": precision, "recall": recall}
+
+
+
+def compute_set_accuracy_metrics(pred):
+    labels_ids = pred.label_ids
+    pred_ids = pred.predictions[0]
+    #pred_ids = logits.argmax(axis=-1)
+    tp=0
+    tn=0
+    fp=0
+    fn=0
+    pred_ids = np.where(pred_ids != -100, pred_ids, shared.tokenizer.pad_token_id)
+    labels_ids = np.where(labels_ids != -100, labels_ids, shared.tokenizer.pad_token_id)
+
+    pred_ids_new = []
+    label_ids_new = []
+    for i in range(0,len(pred_ids)):        
+        pred_line = pred_ids[i]
+        label_line = labels_ids[i]
+        pred_line_ids = []
+        label_line_ids = []
+        for j in range(1,len(pred_line)):
+            if j>3 and (pred_line[j]>=32496 and pred_line[j]<=32595 or pred_line[j]<=2):
+                break
+            pred_line_ids.append(pred_line[j])
+        pred_ids_new.append(pred_line_ids)
+        for j in range(1,len(label_line)):
+            if j>3 and (label_line[j]>=32496 and label_line[j]<=32595 or label_line[j]<=2):
+                break
+            label_line_ids.append(label_line[j])
+        label_ids_new.append(label_line_ids)    
+
+    # all unnecessary tokens are removed    
+    pred_str = shared.tokenizer.batch_decode(pred_ids_new, skip_special_tokens=False,clean_up_tokenization_spaces=True)
+    label_str = shared.tokenizer.batch_decode(label_ids_new, skip_special_tokens=False,clean_up_tokenization_spaces=True)
+    for i in range(0,len(pred_str)):
+        #preds = pred_str[i].replace('<pad>','').replace(' ','').split('[SEP]')
+        preds = re.split('�|\[SEP\]|\s',pred_str[i])
+        #labels = label_str[i].replace('<pad>','').replace(' ','').split('[SEP]')
+        labels = re.split('�|\[SEP\]|\s',label_str[i])
+        tp0,fp0,tn0,fn0 = compute_set_accuracy_f1_matric(labels,preds)
+        tp+=tp0
+        fp+=fp0
+        tn+=tn0
+        fn+=fn0
+
+    precision = tp/(tp+fp)
+    recall = tp/(tp+fn)
+    if tp==0:
+        f1 = 0
+    else:
+        f1 = 2*precision*recall/(precision+recall)
+    return {"precision": precision, "recall": recall, "f1": f1}
+
+
+def compute_set_accuracy_f1_matric(labels,preds):
+    tp=0
+    fp=0
+    tn=0
+    fn=0
+    for pred in preds:
+        if pred=='':
+            continue
+        if pred in labels:
+            tp+=1
+        else:
+            fp+=1
+    for label in labels:
+        if label=='':
+            continue
+        if label not in preds:
+            fn+=1
+    return (tp,fp,tn,fn)

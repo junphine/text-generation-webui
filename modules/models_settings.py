@@ -106,6 +106,9 @@ def get_model_metadata(model):
 
 
 def infer_loader(model_name, model_settings):
+    shared.is_external_api = '.py' in model_name.lower()
+    if shared.is_external_api:
+        return 'External_Api'
     path_to_model = Path(f'{shared.args.model_dir}/{model_name}')
     if not path_to_model.exists():
         loader = None
@@ -195,6 +198,9 @@ def apply_model_settings_to_state(model, state):
             else:
                 state[k] = model_settings[k]
 
+    # add@byron
+    shared.settings.update(model_settings)  # hijacking the interface defaults
+    # end
     return state
 
 

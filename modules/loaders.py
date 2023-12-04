@@ -143,6 +143,14 @@ loaders_and_params = OrderedDict({
         'no_mmap',
         'mlock'
     ],
+    'External_Api': [
+        'gpu_split',
+        'max_seq_len',
+        'compress_pos_emb',
+        'alpha_value',
+        'model_type'
+    ]
+	
 })
 
 loaders_samplers = {

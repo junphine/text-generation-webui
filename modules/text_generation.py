@@ -151,7 +151,8 @@ def get_encoded_length(prompt):
     length_after_extensions = apply_extensions('tokenized_length', prompt)
     if length_after_extensions is not None:
         return length_after_extensions
-
+    if shared.is_external_api:
+        return len(prompt)//5
     return len(encode(prompt)[0])
 
 

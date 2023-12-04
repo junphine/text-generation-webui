@@ -69,6 +69,8 @@ def load_model(model_name, loader=None):
         'ExLlamav2_HF': ExLlamav2_HF_loader,
         'ctransformers': ctransformers_loader,
         'AutoAWQ': AutoAWQ_loader,
+        'External_Api': External_Api_loader
+		
     }
 
     metadata = get_model_metadata(model_name)
@@ -112,6 +114,9 @@ def load_model(model_name, loader=None):
 def load_tokenizer(model_name, model):
     tokenizer = None
     path_to_model = Path(f"{shared.args.model_dir}/{model_name}/")
+    if shared.is_seq2seq:
+        tokenizer = T5Tokenizer.from_pretrained(path_to_model)
+        return tokenizer
     if any(s in model_name.lower() for s in ['gpt-4chan', 'gpt4chan']) and Path(f"{shared.args.model_dir}/gpt-j-6B/").exists():
         tokenizer = AutoTokenizer.from_pretrained(Path(f"{shared.args.model_dir}/gpt-j-6B/"))
     elif path_to_model.exists():
@@ -386,6 +391,20 @@ def RWKV_loader(model_name):
 
     tokenizer = RWKVTokenizer.from_pretrained(Path(shared.args.model_dir))
     return model, tokenizer
+
+
+def External_Api_loader(model_name):
+    print(f"Using external api: {model_name}")
+    try:
+        model_name = model_name[:-3]
+        exec(f"import models.{model_name}")
+        model_proxy = eval(f"models.{model_name}.model_handler")
+        tokenizer_proxy = eval(f"models.{model_name}.tokenizer_handler")
+        print('Ok.')
+        return model_proxy(),tokenizer_proxy()
+    except Exception as e:
+        print('Fail.'+ str(e))
+        return None, None
 
 
 def get_max_memory_dict():

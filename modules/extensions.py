@@ -188,8 +188,14 @@ def create_extensions_block():
     if len(to_display) > 0:
         with gr.Column(elem_id="extensions"):
             for row in to_display:
-                extension, _ = row
-                extension.ui()
+                extension, name = row
+                display_name = getattr(extension, 'params', {}).get('display_name', '')
+                if display_name:
+                    #gr.Markdown(f"\n### {display_name}")
+                    with gr.Accordion(display_name, open=False):
+                        extension.ui()
+                else:
+                    extension.ui()
 
 
 def create_extensions_tabs():

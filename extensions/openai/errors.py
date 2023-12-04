@@ -1,8 +1,9 @@
 class OpenAIError(Exception):
-    def __init__(self, message=None, code=500, internal_message=''):
+    def __init__(self, message=None, code=500, error_type='OpenAIError', internal_message=''):
         self.message = message
         self.code = code
         self.internal_message = internal_message
+        self.error_type = error_type
 
     def __repr__(self):
         return "%s(message=%r, code=%d)" % (
@@ -13,8 +14,8 @@ class OpenAIError(Exception):
 
 
 class InvalidRequestError(OpenAIError):
-    def __init__(self, message, param, code=400, internal_message=''):
-        super().__init__(message, code, internal_message)
+    def __init__(self, message, param=None, code=400, error_type='InvalidRequestError', internal_message=''):
+        super(InvalidRequestError, self).__init__(message, code, error_type, internal_message)
         self.param = param
 
     def __repr__(self):
@@ -27,5 +28,5 @@ class InvalidRequestError(OpenAIError):
 
 
 class ServiceUnavailableError(OpenAIError):
-    def __init__(self, message="Service unavailable, please try again later.", code=503, internal_message=''):
-        super().__init__(message, code, internal_message)
+    def __init__(self, message=None, code=500, error_type='ServiceUnavailableError', internal_message=''):
+        super(ServiceUnavailableError, self).__init__(message, code, error_type, internal_message)
