@@ -82,15 +82,22 @@ def select_character(evt: gr.SelectData):
     return (evt.value[1])
 
 
+def custom_js():
+    path_to_js = Path(__file__).parent.resolve() / 'script.js'
+    return open(path_to_js, 'r').read()
+
+
 def ui():
-    with gr.Accordion("Character gallery", open=False):
+    with gr.Accordion("Character gallery", open=False, elem_id='gallery-extension'):
         update = gr.Button("Refresh")
         gr.HTML(value="<style>" + generate_css() + "</style>")
-        gallery = gr.Dataset(components=[gr.HTML(visible=False)],
-                             label="",
-                             samples=generate_html(),
-                             elem_classes=["character-gallery"],
-                             samples_per_page=50
-                             )
+        gallery = gr.Dataset(
+            components=[gr.HTML(visible=False)],
+            label="",
+            samples=generate_html(),
+            elem_classes=["character-gallery"],
+            samples_per_page=50
+        )
+
     update.click(generate_html, [], gallery)
     gallery.select(select_character, None, gradio['character_menu'])

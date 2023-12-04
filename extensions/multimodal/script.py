@@ -35,25 +35,35 @@ input_hijack = {
 multimodal_embedder: MultimodalEmbedder = None
 
 
+def chat_input_modifier(text, visible_text, state):
+    global input_hijack
+    if input_hijack['state']:
+        input_hijack['state'] = False
+        return input_hijack['value'](text, visible_text)
+    else:
+        return text, visible_text
+
+
 def add_chat_picture(picture, text, visible_text):
     # resize the image, so that shortest edge is at least 224 (size for CLIP), and at most 300 (to keep history manageable)
+    # Adjusted to 336 for the values here, due to the increased resolution in llava-v1.5
     max_hw, min_hw = max(picture.size), min(picture.size)
     aspect_ratio = max_hw / min_hw
-    shortest_edge = int(max(300 / aspect_ratio, 224))
+    shortest_edge = int(max(336 / aspect_ratio, 336))
     longest_edge = int(shortest_edge * aspect_ratio)
     w = shortest_edge if picture.width < picture.height else longest_edge
     h = shortest_edge if picture.width >= picture.height else longest_edge
     picture = picture.resize((w, h))
 
     buffer = BytesIO()
-    picture.save(buffer, format="JPEG")
+    picture.save(buffer, format="PNG")
     img_str = base64.b64encode(buffer.getvalue()).decode('utf-8')
     image = f'<img src="data:image/jpeg;base64,{img_str}">'
 
     if '<image>' in text:
         text = text.replace('<image>', image)
     else:
-        text = text + '\n' + image
+        text = image + '\n' + text
 
     if visible_text == '' or visible_text is None:
         visible_text = text

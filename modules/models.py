@@ -2,11 +2,13 @@ import gc
 import os
 import re
 import time
+import traceback
 from pathlib import Path
 
 import torch
 import transformers
 from accelerate import infer_auto_device_map, init_empty_weights
+from accelerate.utils import is_ccl_available, is_xpu_available
 from transformers import (
     AutoConfig,
     AutoModel,
@@ -14,13 +16,13 @@ from transformers import (
     AutoModelForSeq2SeqLM,
     AutoTokenizer,
     BitsAndBytesConfig,
-    LlamaTokenizer
+    GPTQConfig
 )
 
 import modules.shared as shared
-from modules import llama_attn_hijack, sampler_hijack
+from modules import RoPE, llama_attn_hijack, sampler_hijack
 from modules.logging_colors import logger
-from modules.models_settings import infer_loader
+from modules.models_settings import get_model_metadata
 
 transformers.logging.set_verbosity_error()
 
@@ -37,8 +39,12 @@ if shared.args.deepspeed:
     # Distributed setup
     local_rank = shared.args.local_rank if shared.args.local_rank is not None else int(os.getenv("LOCAL_RANK", "0"))
     world_size = int(os.getenv("WORLD_SIZE", "1"))
-    torch.cuda.set_device(local_rank)
-    deepspeed.init_distributed()
+    if is_xpu_available() and is_ccl_available():
+        torch.xpu.set_device(local_rank)
+        deepspeed.init_distributed(backend="ccl")
+    else:
+        torch.cuda.set_device(local_rank)
+        deepspeed.init_distributed()
     ds_config = generate_ds_config(shared.args.bf16, 1 * world_size, shared.args.nvme_offload_dir)
     dschf = HfDeepSpeedConfig(ds_config)  # Keep this object alive for the Transformers integration
 
@@ -55,27 +61,30 @@ def load_model(model_name, loader=None):
         'AutoGPTQ': AutoGPTQ_loader,
         'GPTQ-for-LLaMa': GPTQ_loader,
         'llama.cpp': llamacpp_loader,
-        'FlexGen': flexgen_loader,
+        'llamacpp_HF': llamacpp_HF_loader,
         'RWKV': RWKV_loader,
         'ExLlama': ExLlama_loader,
         'ExLlama_HF': ExLlama_HF_loader,
-        'External_Api': External_Api_loader
+        'ExLlamav2': ExLlamav2_loader,
+        'ExLlamav2_HF': ExLlamav2_HF_loader,
+        'ctransformers': ctransformers_loader,
+        'AutoAWQ': AutoAWQ_loader,
     }
 
-    if loader is None or loader=='':
+    metadata = get_model_metadata(model_name)
+    if loader is None:
         if shared.args.loader is not None:
             loader = shared.args.loader
         else:
-            loader = infer_loader(model_name)
+            loader = metadata['loader']
             if loader is None:
                 logger.error('The path to the model does not exist. Exiting.')
-                return None, None
+                raise ValueError
 
     shared.args.loader = loader
     output = load_func_map[loader](model_name)
     if type(output) is tuple:
         model, tokenizer = output
-		
     else:
         model = output
         if model is None:
@@ -87,85 +96,94 @@ def load_model(model_name, loader=None):
     if any((shared.args.xformers, shared.args.sdp_attention)):
         llama_attn_hijack.hijack_llama_attention()
 
-    logger.info(f"Loaded the model in {(time.time()-t0):.2f} seconds.\n")
+    shared.settings.update({k: v for k, v in metadata.items() if k in shared.settings})
+    if loader.lower().startswith('exllama'):
+        shared.settings['truncation_length'] = shared.args.max_seq_len
+    elif loader in ['llama.cpp', 'llamacpp_HF', 'ctransformers']:
+        shared.settings['truncation_length'] = shared.args.n_ctx
+
+    logger.info(f"LOADER: {loader}")
+    logger.info(f"TRUNCATION LENGTH: {shared.settings['truncation_length']}")
+    logger.info(f"INSTRUCTION TEMPLATE: {shared.settings['instruction_template']}")
+    logger.info(f"Loaded the model in {(time.time()-t0):.2f} seconds.")
     return model, tokenizer
 
 
 def load_tokenizer(model_name, model):
     tokenizer = None
+    path_to_model = Path(f"{shared.args.model_dir}/{model_name}/")
     if any(s in model_name.lower() for s in ['gpt-4chan', 'gpt4chan']) and Path(f"{shared.args.model_dir}/gpt-j-6B/").exists():
         tokenizer = AutoTokenizer.from_pretrained(Path(f"{shared.args.model_dir}/gpt-j-6B/"))
-    elif model.__class__.__name__ in ['LlamaForCausalLM', 'LlamaGPTQForCausalLM', 'ExllamaHF']:
-        # Try to load an universal LLaMA tokenizer
-        if not any(s in shared.model_name.lower() for s in ['llava', 'oasst']):
-            for p in [Path(f"{shared.args.model_dir}/llama-tokenizer/"), Path(f"{shared.args.model_dir}/oobabooga_llama-tokenizer/")]:
-                if p.exists():
-                    logger.info(f"Loading the universal LLaMA tokenizer from {p}...")
-                    tokenizer = LlamaTokenizer.from_pretrained(p, clean_up_tokenization_spaces=True)
-                    return tokenizer
+    elif path_to_model.exists():
+        if shared.args.no_use_fast:
+            logger.info('Loading the tokenizer with use_fast=False.')
 
-        # Otherwise, load it from the model folder and hope that these
-        # are not outdated tokenizer files.
-        tokenizer = LlamaTokenizer.from_pretrained(Path(f"{shared.args.model_dir}/{model_name}/"), clean_up_tokenization_spaces=True)
-        try:
-            tokenizer.eos_token_id = 2
-            tokenizer.bos_token_id = 1
-            tokenizer.pad_token_id = 0
-        except:
-            pass
-    else:
-        path_to_model = Path(f"{shared.args.model_dir}/{model_name}/")
-        if path_to_model.exists():
-            tokenizer = AutoTokenizer.from_pretrained(path_to_model, trust_remote_code=shared.args.trust_remote_code)
+        tokenizer = AutoTokenizer.from_pretrained(
+            path_to_model,
+            trust_remote_code=shared.args.trust_remote_code,
+            use_fast=not shared.args.no_use_fast
+        )
 
     return tokenizer
 
 
 def huggingface_loader(model_name):
+
     path_to_model = Path(f'{shared.args.model_dir}/{model_name}')
+    params = {
+        'low_cpu_mem_usage': True,
+        'trust_remote_code': shared.args.trust_remote_code,
+        'torch_dtype': torch.bfloat16 if shared.args.bf16 else torch.float16,
+        'use_safetensors': True if shared.args.force_safetensors else None
+    }
+
+    if shared.args.use_flash_attention_2:
+        params['use_flash_attention_2'] = True
+
+    config = AutoConfig.from_pretrained(path_to_model, trust_remote_code=params['trust_remote_code'])
+
     if 'chatglm' in model_name.lower():
         LoaderClass = AutoModel
     else:
-        config = AutoConfig.from_pretrained(path_to_model, trust_remote_code=shared.args.trust_remote_code)
-        if config.to_dict().get("is_encoder_decoder", False):
+        if config.to_dict().get('is_encoder_decoder', False):
             LoaderClass = AutoModelForSeq2SeqLM
             shared.is_seq2seq = True
         else:
             LoaderClass = AutoModelForCausalLM
 
     # Load the model in simple 16-bit mode by default
-    if not any([shared.args.cpu, shared.args.load_in_8bit, shared.args.load_in_4bit, shared.args.auto_devices, shared.args.disk, shared.args.deepspeed, shared.args.gpu_memory is not None, shared.args.cpu_memory is not None]):
-        model = LoaderClass.from_pretrained(Path(f"{shared.args.model_dir}/{model_name}"), low_cpu_mem_usage=True, torch_dtype=torch.bfloat16 if shared.args.bf16 else torch.float16, trust_remote_code=shared.args.trust_remote_code)
-        if torch.has_mps:
+    if not any([shared.args.cpu, shared.args.load_in_8bit, shared.args.load_in_4bit, shared.args.auto_devices, shared.args.disk, shared.args.deepspeed, shared.args.gpu_memory is not None, shared.args.cpu_memory is not None, shared.args.compress_pos_emb > 1, shared.args.alpha_value > 1, shared.args.disable_exllama]):
+        model = LoaderClass.from_pretrained(path_to_model, **params)
+        if torch.backends.mps.is_available():
             device = torch.device('mps')
+            model = model.to(device)
+        elif is_xpu_available():
+            device = torch.device("xpu")
             model = model.to(device)
         else:
             model = model.cuda()
 
     # DeepSpeed ZeRO-3
     elif shared.args.deepspeed:
-        model = LoaderClass.from_pretrained(Path(f"{shared.args.model_dir}/{model_name}"), torch_dtype=torch.bfloat16 if shared.args.bf16 else torch.float16)
+        model = LoaderClass.from_pretrained(path_to_model, torch_dtype=params['torch_dtype'])
         model = deepspeed.initialize(model=model, config_params=ds_config, model_parameters=None, optimizer=None, lr_scheduler=None)[0]
         model.module.eval()  # Inference
-        logger.info(f"DeepSpeed ZeRO-3 is enabled: {is_deepspeed_zero3_enabled()}")
+        logger.info(f'DeepSpeed ZeRO-3 is enabled: {is_deepspeed_zero3_enabled()}')
 
-    # Custom
+    # Load with quantization and/or offloading
     else:
-        params = {
-            "low_cpu_mem_usage": True,
-            "trust_remote_code": shared.args.trust_remote_code
-        }
 
-        if not any((shared.args.cpu, torch.cuda.is_available(), torch.has_mps)):
-            logger.warning("torch.cuda.is_available() returned False. This means that no GPU has been detected. Falling back to CPU mode.")
+        if not any((shared.args.cpu, torch.cuda.is_available(), is_xpu_available(), torch.backends.mps.is_available())):
+            logger.warning('torch.cuda.is_available() and is_xpu_available() returned False. This means that no GPU has been detected. Falling back to CPU mode.')
+
             shared.args.cpu = True
 
         if shared.args.cpu:
-            params["torch_dtype"] = torch.float32
+            params['torch_dtype'] = torch.float32
         else:
-            params["device_map"] = 'auto'
+            params['device_map'] = 'auto'
+            params['max_memory'] = get_max_memory_dict()
             if shared.args.load_in_4bit:
-
                 # See https://github.com/huggingface/transformers/pull/23479/files
                 # and https://huggingface.co/blog/4bit-transformers-bitsandbytes
                 quantization_config_params = {
@@ -175,73 +193,48 @@ def huggingface_loader(model_name):
                     'bnb_4bit_use_double_quant': shared.args.use_double_quant,
                 }
 
-                logger.warning("Using the following 4-bit params: " + str(quantization_config_params))
+                logger.info('Using the following 4-bit params: ' + str(quantization_config_params))
                 params['quantization_config'] = BitsAndBytesConfig(**quantization_config_params)
 
-            elif shared.args.load_in_8bit and any((shared.args.auto_devices, shared.args.gpu_memory)):
-                params['quantization_config'] = BitsAndBytesConfig(load_in_8bit=True, llm_int8_enable_fp32_cpu_offload=True)
             elif shared.args.load_in_8bit:
-                params['quantization_config'] = BitsAndBytesConfig(load_in_8bit=True)
-            elif shared.args.bf16:
-                params["torch_dtype"] = torch.bfloat16
-            else:
-                params["torch_dtype"] = torch.float16
+                if any((shared.args.auto_devices, shared.args.gpu_memory)):
+                    params['quantization_config'] = BitsAndBytesConfig(load_in_8bit=True, llm_int8_enable_fp32_cpu_offload=True)
+                else:
+                    params['quantization_config'] = BitsAndBytesConfig(load_in_8bit=True)
 
-            params['max_memory'] = get_max_memory_dict()
+                if params['max_memory'] is not None:
+                    with init_empty_weights():
+                        model = LoaderClass.from_config(config, trust_remote_code=params['trust_remote_code'])
+
+                    model.tie_weights()
+                    params['device_map'] = infer_auto_device_map(
+                        model,
+                        dtype=torch.int8,
+                        max_memory=params['max_memory'],
+                        no_split_module_classes=model._no_split_modules
+                    )
+
             if shared.args.disk:
-                params["offload_folder"] = shared.args.disk_cache_dir
+                params['offload_folder'] = shared.args.disk_cache_dir
 
-        checkpoint = Path(f'{shared.args.model_dir}/{model_name}')
-        if shared.args.load_in_8bit and params.get('max_memory', None) is not None and params['device_map'] == 'auto':
-            config = AutoConfig.from_pretrained(checkpoint, trust_remote_code=shared.args.trust_remote_code)
-            with init_empty_weights():
-                model = LoaderClass.from_config(config, trust_remote_code=shared.args.trust_remote_code)
+        if shared.args.disable_exllama:
+            try:
+                gptq_config = GPTQConfig(bits=config.quantization_config.get('bits', 4), disable_exllama=True)
+                params['quantization_config'] = gptq_config
+                logger.info('Loading with ExLlama kernel disabled.')
+            except:
+                exc = traceback.format_exc()
+                logger.error('Failed to disable exllama. Does the config.json for this model contain the necessary quantization info?')
+                print(exc)
 
-            model.tie_weights()
-            params['device_map'] = infer_auto_device_map(
-                model,
-                dtype=torch.int8,
-                max_memory=params['max_memory'],
-                no_split_module_classes=model._no_split_modules
-            )
+        if shared.args.compress_pos_emb > 1:
+            params['rope_scaling'] = {'type': 'linear', 'factor': shared.args.compress_pos_emb}
+        elif shared.args.alpha_value > 1:
+            params['rope_scaling'] = {'type': 'dynamic', 'factor': RoPE.get_alpha_value(shared.args.alpha_value, shared.args.rope_freq_base)}
 
-        model = LoaderClass.from_pretrained(checkpoint, **params)
+        model = LoaderClass.from_pretrained(path_to_model, **params)
 
     return model
-
-
-def flexgen_loader(model_name):
-    from flexgen.flex_opt import CompressionConfig, ExecutionEnv, OptLM, Policy
-
-    # Initialize environment
-    env = ExecutionEnv.create(shared.args.disk_cache_dir)
-
-    # Offloading policy
-    policy = Policy(1, 1,
-                    shared.args.percent[0], shared.args.percent[1],
-                    shared.args.percent[2], shared.args.percent[3],
-                    shared.args.percent[4], shared.args.percent[5],
-                    overlap=True, sep_layer=True, pin_weight=shared.args.pin_weight,
-                    cpu_cache_compute=False, attn_sparsity=1.0,
-                    compress_weight=shared.args.compress_weight,
-                    comp_weight_config=CompressionConfig(
-                        num_bits=4, group_size=64,
-                        group_dim=0, symmetric=False),
-                    compress_cache=False,
-                    comp_cache_config=CompressionConfig(
-                        num_bits=4, group_size=64,
-                        group_dim=2, symmetric=False))
-
-    model = OptLM(f"facebook/{model_name}", env, shared.args.model_dir, policy)
-    return model
-
-
-def RWKV_loader(model_name):
-    from modules.RWKV import RWKVModel, RWKVTokenizer
-
-    model = RWKVModel.from_pretrained(Path(f'{shared.args.model_dir}/{model_name}'), dtype="fp32" if shared.args.cpu else "bf16" if shared.args.bf16 else "fp16", device="cpu" if shared.args.cpu else "cuda")
-    tokenizer = RWKVTokenizer.from_pretrained(Path(shared.args.model_dir))
-    return model, tokenizer
 
 
 def llamacpp_loader(model_name):
@@ -251,11 +244,81 @@ def llamacpp_loader(model_name):
     if path.is_file():
         model_file = path
     else:
-        model_file = list(Path(f'{shared.args.model_dir}/{model_name}').glob('*ggml*.bin'))[0]
+        model_file = list(Path(f'{shared.args.model_dir}/{model_name}').glob('*.gguf'))[0]
 
-    logger.info(f"llama.cpp weights detected: {model_file}\n")
+    logger.info(f"llama.cpp weights detected: {model_file}")
     model, tokenizer = LlamaCppModel.from_pretrained(model_file)
     return model, tokenizer
+
+
+def llamacpp_HF_loader(model_name):
+    from modules.llamacpp_hf import LlamacppHF
+
+    for fname in [model_name, "oobabooga_llama-tokenizer", "llama-tokenizer"]:
+        path = Path(f'{shared.args.model_dir}/{fname}')
+        if all((path / file).exists() for file in ['tokenizer_config.json', 'special_tokens_map.json', 'tokenizer.model']):
+            logger.info(f'Using tokenizer from: {path}')
+            break
+    else:
+        logger.error("Could not load the model because a tokenizer in transformers format was not found. Please download oobabooga/llama-tokenizer.")
+        return None, None
+
+    if shared.args.no_use_fast:
+        logger.info('Loading the tokenizer with use_fast=False.')
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        path,
+        trust_remote_code=shared.args.trust_remote_code,
+        use_fast=not shared.args.no_use_fast
+    )
+
+    model = LlamacppHF.from_pretrained(model_name)
+    return model, tokenizer
+
+
+def ctransformers_loader(model_name):
+    from modules.ctransformers_model import CtransformersModel
+
+    path = Path(f'{shared.args.model_dir}/{model_name}')
+    ctrans = CtransformersModel()
+    if ctrans.model_type_is_auto():
+        model_file = path
+    else:
+        if path.is_file():
+            model_file = path
+        else:
+            entries = Path(f'{shared.args.model_dir}/{model_name}')
+            gguf = list(entries.glob('*.gguf'))
+            bin = list(entries.glob('*.bin'))
+            if len(gguf) > 0:
+                model_file = gguf[0]
+            elif len(bin) > 0:
+                model_file = bin[0]
+            else:
+                logger.error("Could not find a model for ctransformers.")
+                return None, None
+
+    logger.info(f'ctransformers weights detected: {model_file}')
+    model, tokenizer = ctrans.from_pretrained(model_file)
+    return model, tokenizer
+
+
+def AutoAWQ_loader(model_name):
+    from awq import AutoAWQForCausalLM
+
+    model_dir = Path(f'{shared.args.model_dir}/{model_name}')
+
+    model = AutoAWQForCausalLM.from_quantized(
+                quant_path=model_dir,
+                max_new_tokens=shared.args.max_seq_len,
+                trust_remote_code=shared.args.trust_remote_code,
+                fuse_layers=not shared.args.no_inject_fused_attention,
+                max_memory=get_max_memory_dict(),
+                batch_size=1,
+                safetensors=any(model_dir.glob('*.safetensors')),
+            )
+
+    return model
 
 
 def GPTQ_loader(model_name):
@@ -295,40 +358,62 @@ def ExLlama_HF_loader(model_name):
     return ExllamaHF.from_pretrained(model_name)
 
 
-def External_Api_loader(model_name):
-    print(f"Using external api: {model_name}")
-    try:
-        model_name = model_name[:-3]
-        exec(f"import models.{model_name}")
-        model_proxy = eval(f"models.{model_name}.model_handler")
-        tokenizer_proxy = eval(f"models.{model_name}.tokenizer_handler")
-        print('Ok.')
-        return model_proxy(),tokenizer_proxy()
-    except Exception as e:
-        print('Fail.'+ str(e))
-        return None, None
+def ExLlamav2_loader(model_name):
+    from modules.exllamav2 import Exllamav2Model
+
+    model, tokenizer = Exllamav2Model.from_pretrained(model_name)
+    return model, tokenizer
+
+
+def ExLlamav2_HF_loader(model_name):
+    from modules.exllamav2_hf import Exllamav2HF
+
+    return Exllamav2HF.from_pretrained(model_name)
+
+
+def RWKV_loader(model_name):
+    '''
+    This loader is not currently maintained as RWKV can now be loaded
+    through the transformers library.
+    '''
+    from modules.RWKV import RWKVModel, RWKVTokenizer
+
+    model = RWKVModel.from_pretrained(
+        Path(f'{shared.args.model_dir}/{model_name}'),
+        dtype="fp32" if shared.args.cpu else "bf16" if shared.args.bf16 else "fp16",
+        device="cpu" if shared.args.cpu else "xpu" if is_xpu_available() else "cuda"
+    )
+
+    tokenizer = RWKVTokenizer.from_pretrained(Path(shared.args.model_dir))
+    return model, tokenizer
+
 
 def get_max_memory_dict():
     max_memory = {}
+    max_cpu_memory = shared.args.cpu_memory.strip() if shared.args.cpu_memory is not None else '99GiB'
     if shared.args.gpu_memory:
         memory_map = list(map(lambda x: x.strip(), shared.args.gpu_memory))
         for i in range(len(memory_map)):
             max_memory[i] = f'{memory_map[i]}GiB' if not re.match('.*ib$', memory_map[i].lower()) else memory_map[i]
 
-        max_cpu_memory = shared.args.cpu_memory.strip() if shared.args.cpu_memory is not None else '99GiB'
         max_memory['cpu'] = f'{max_cpu_memory}GiB' if not re.match('.*ib$', max_cpu_memory.lower()) else max_cpu_memory
 
     # If --auto-devices is provided standalone, try to get a reasonable value
     # for the maximum memory of device :0
     elif shared.args.auto_devices:
-        total_mem = (torch.cuda.get_device_properties(0).total_memory / (1024 * 1024))
+        if is_xpu_available():
+            total_mem = (torch.xpu.get_device_properties(0).total_memory / (1024 * 1024))
+        else:
+            total_mem = (torch.cuda.get_device_properties(0).total_memory / (1024 * 1024))
+
         suggestion = round((total_mem - 1000) / 1000) * 1000
         if total_mem - suggestion < 800:
             suggestion -= 1000
 
         suggestion = int(round(suggestion / 1000))
         logger.warning(f"Auto-assiging --gpu-memory {suggestion} for your GPU to try to prevent out-of-memory errors. You can manually set other values.")
-        max_memory = {0: f'{suggestion}GiB', 'cpu': f'{shared.args.cpu_memory or 99}GiB'}
+        max_memory[0] = f'{suggestion}GiB'
+        max_memory['cpu'] = f'{max_cpu_memory}GiB' if not re.match('.*ib$', max_cpu_memory.lower()) else max_cpu_memory
 
     return max_memory if len(max_memory) > 0 else None
 
@@ -336,11 +421,16 @@ def get_max_memory_dict():
 def clear_torch_cache():
     gc.collect()
     if not shared.args.cpu:
-        torch.cuda.empty_cache()
+        if is_xpu_available():
+            torch.xpu.empty_cache()
+        else:
+            torch.cuda.empty_cache()
 
 
 def unload_model():
     shared.model = shared.tokenizer = None
+    shared.lora_names = []
+    shared.model_dirty_from_training = False
     clear_torch_cache()
 
 
